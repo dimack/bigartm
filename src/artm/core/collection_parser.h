@@ -22,11 +22,11 @@ namespace core {
 // (somehting like 000001.batch, 000002.batch, etc.)
 class BatchNameGenerator {
  public:
-  explicit BatchNameGenerator(int length, bool use_guid_name);
+  explicit BatchNameGenerator(size_t length, bool use_guid_name);
   std::string next_name(const Batch& batch);
 
  private:
-  int length_;
+  size_t length_;
   std::string next_name_;
   bool use_guid_name_;
 };

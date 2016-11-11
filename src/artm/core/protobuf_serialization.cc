@@ -25,7 +25,7 @@ void ProtobufSerialization::ParseFromString(const std::string& string, google::p
   }
 }
 
-void ProtobufSerialization::ParseFromArray(const char* buffer, int length, google::protobuf::Message* message) {
+void ProtobufSerialization::ParseFromArray(const char* buffer, size_t length, google::protobuf::Message* message) {
   ParseFromString((length >= 0) ? std::string(buffer, length) : std::string(buffer), message);
 }
 

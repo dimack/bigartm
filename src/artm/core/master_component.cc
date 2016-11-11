@@ -256,7 +256,7 @@ void MasterComponent::ImportModel(const ImportModelArgs& args) {
 
   std::shared_ptr<DensePhiMatrix> target;
   while (!fin.eof()) {
-    int length;
+    size_t length;
     fin >> length;
     if (fin.eof())
       break;

@@ -37,7 +37,7 @@ int ArtmExecute(int master_id, const ArgsT& args, FuncT func) {
 
 template<typename ResultT, typename ArgsT, typename FuncT>
 ResultT ArtmRequest(int master_id, const ArgsT& args, FuncT func) {
-  int length = ArtmExecute(master_id, args, func);
+  size_t length = ArtmExecute(master_id, args, func);
 
   std::string result_blob;
   result_blob.resize(length);

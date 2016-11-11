@@ -34,7 +34,7 @@ using ::artm::utility::ifstream_or_cin;
 namespace artm {
 namespace core {
 
-BatchNameGenerator::BatchNameGenerator(int length, bool use_guid_name)
+BatchNameGenerator::BatchNameGenerator(size_t length, bool use_guid_name)
   : length_(length),
     next_name_(std::string()),
     use_guid_name_(use_guid_name) {

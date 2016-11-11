@@ -92,7 +92,7 @@ void DictionaryOperations::Export(const ExportDictionaryArgs& args, const Dictio
   }
 
   std::string str = token_dict_data.SerializeAsString();
-  int length = static_cast<int>(str.size());
+  size_t length = static_cast<int>(str.size());
   fout.write(reinterpret_cast<char *>(&length), sizeof(length));
   fout << str;
 
@@ -128,7 +128,7 @@ void DictionaryOperations::Export(const ExportDictionaryArgs& args, const Dictio
 
       if ((current_cooc_length >= max_cooc_length) || ((token_id + 1) == token_size)) {
         std::string str = cooc_dict_data.SerializeAsString();
-        int length = static_cast<int>(str.size());
+        size_t length = static_cast<int>(str.size());
         fout.write(reinterpret_cast<char *>(&length), sizeof(length));
         fout << str;
         cooc_dict_data.clear_cooc_first_index();
@@ -167,7 +167,7 @@ std::shared_ptr<Dictionary> DictionaryOperations::Import(const ImportDictionaryA
   }
 
   while (!fin.eof()) {
-    int length;
+    size_t length;
     fin.read(reinterpret_cast<char *>(&length), sizeof(length));
     if (fin.eof())
       break;

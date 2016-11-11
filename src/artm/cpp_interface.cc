@@ -82,7 +82,7 @@ int ArtmExecute(int master_id, const ArgsT& args, FuncT func) {
 }
 
 template<typename ResultT>
-ResultT ArtmCopyResult(int length) {
+ResultT ArtmCopyResult(size_t length) {
   std::string result_blob;
   result_blob.resize(length);
   HandleErrorCode(ArtmCopyRequestedMessage(length, StringAsArray(&result_blob)));
@@ -94,13 +94,13 @@ ResultT ArtmCopyResult(int length) {
 
 template<typename ResultT, typename FuncT>
 ResultT ArtmRequest(int master_id, FuncT func) {
-  int length = func(master_id);
+  size_t length = func(master_id);
   return ArtmCopyResult<ResultT>(length);
 }
 
 template<typename ResultT, typename ArgsT, typename FuncT>
 ResultT ArtmRequest(int master_id, const ArgsT& args, FuncT func) {
-  int length = ArtmExecute(master_id, args, func);
+  size_t length = (size_t)ArtmExecute(master_id, args, func);
   return ArtmCopyResult<ResultT>(length);
 }
 
@@ -115,12 +115,12 @@ void ArtmRequestMatrix(int no_rows, int no_cols, Matrix* matrix) {
 
   matrix->resize(no_rows, no_cols);
 
-  int length = sizeof(float) * matrix->no_columns() * matrix->no_rows();
+  size_t length = sizeof(float) * matrix->no_columns() * matrix->no_rows();
   HandleErrorCode(ArtmCopyRequestedObject(length, reinterpret_cast<char*>(matrix->get_data())));
 }
 
 CollectionParserInfo ParseCollection(const CollectionParserConfig& config) {
-  int length = ArtmExecute(config, ArtmParseCollection);
+  size_t length = (size_t)ArtmExecute(config, ArtmParseCollection);
   return ArtmCopyResult<CollectionParserInfo>(length);
 }
 
@@ -129,7 +129,7 @@ void ConfigureLogging(const ConfigureLoggingArgs& args) {
 }
 
 Batch LoadBatch(std::string filename) {
-  int length = ArtmRequestLoadBatch(filename.c_str());
+  size_t length = ArtmRequestLoadBatch(filename.c_str());
   return ArtmCopyResult<Batch>(length);
 }
 

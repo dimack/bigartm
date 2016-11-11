@@ -24,7 +24,7 @@ class ProtobufSerialization {
   bool IsBinary() { return !use_json_format_; }
 
   void ParseFromString(const std::string& string, google::protobuf::Message* message);
-  void ParseFromArray(const char* buffer, int length, google::protobuf::Message* message);
+  void ParseFromArray(const char* buffer, size_t length, google::protobuf::Message* message);
   void SerializeToString(const google::protobuf::Message& message, std::string* output);
   std::string SerializeAsString(const google::protobuf::Message& message);
 
