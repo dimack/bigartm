@@ -2,12 +2,14 @@
 #include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <fstream>
+#include <future>
 #include <cstring>
 #include <iostream>
 #include <iomanip>
-#include <vector>
 #include <set>
-#include <fstream>
+#include <thread>
+#include <vector>
 
 #include "boost/lexical_cast.hpp"
 #include "boost/tokenizer.hpp"
@@ -41,6 +43,15 @@ class CuckooWatch {
  private:
   std::chrono::time_point<std::chrono::system_clock> start_;
 };
+
+static std::string formatByteSize(long long bytes) {
+  std::stringstream ss;
+  int unit = 1024 * 1024;  // MB;
+  if (bytes < unit)
+    return "<1 MB";
+  ss << bytes / unit << " MB";
+  return ss.str();
+}
 
 std::vector<boost::filesystem::path> findFilesInDirectory(std::string root, std::string ext) {
   std::vector<boost::filesystem::path> retval;
@@ -289,6 +300,7 @@ struct artm_options {
   int log_level;
   bool b_paused;
   bool b_disable_avx_opt;
+  int profile;
 
   artm_options() {
     pwt_model_name = "pwt";
@@ -595,6 +607,17 @@ void configureRegularizer(const std::string& regularizer, const std::string& top
   }
 }
 
+void output_profile_information(const MasterModel& master) {
+  auto info = master.info();
+  for (auto& model : info.model())
+    std::cerr << "\tModel " << model.name() << ": " << formatByteSize(model.byte_size()) << ", |T|=" << model.num_topics() << ", |W| = " << model.num_tokens() << ";\n";
+  for (auto& dict : info.dictionary())
+    std::cerr << "\tDictionary " << dict.name() << ": " << formatByteSize(dict.byte_size()) << ", |W|=" << dict.num_entries() << ";\n";
+  int64_t cache_size = 0;
+  for (auto& cache_entity : info.cache_entry()) cache_size += cache_entity.byte_size();
+  std::cerr << "\tCache size: " << formatByteSize(cache_size) << " in total across " << info.cache_entry_size() << " entries;\n";
+}
+
 class ScoreHelper {
  private:
    const artm_options& artm_options_;
@@ -801,10 +824,11 @@ class ScoreHelper {
      }
      else if (type == ::artm::ScoreType_PeakMemory) {
        auto score_data = master_->GetScoreAs< ::artm::PeakMemoryScore>(get_score_args);
-       std::cerr << "PeakMemory      = " << score_data.value() / 1024 << "KB";
+       std::cerr << "PeakMemory      = " << formatByteSize(score_data.value());
        if (boost::to_lower_copy(score_name) != "peakmemory") std::cerr << "\t(" << score_name << ")";
        std::cerr << "\n";
        retval = boost::lexical_cast<std::string>(score_data.value());
+       output_profile_information(*master_);
      }
      else {
        throw std::invalid_argument("Unknown score config type: " + boost::lexical_cast<std::string>(type));
@@ -842,7 +866,8 @@ class ScoreHelper {
        if (output_.is_open()) output_ << sep << score_value;
      }
      if (output_.is_open()) output_ << std::endl;
-     std::cerr << "================= Iteration " << iter << " took " << formatMilliseconds(elapsed_ms) << std::endl;
+     if (iter > 0)
+      std::cerr << "================= Iteration " << iter << " took " << formatMilliseconds(elapsed_ms) << std::endl;
    }
 
    void showScores() {
@@ -1213,6 +1238,46 @@ int execute(const artm_options& options, int argc, char* argv[]) {
     import_model_args.set_model_name(pwt_model_name);
     import_model_args.set_file_name(options.load_model);
     master_component->ImportModel(import_model_args);
+
+    // Retrieve topic names and tokens of the imported model.
+    // Verify the model has all topic names, requested by the used.
+    // If not, find the remaining topics and initialize random matrix.
+    // Use "MergeModel" operation to join loaded model with randomly initialized "remainder".
+    // The tmp_dictionary ensures that both models have the same tokens in their dictionary.
+    ::artm::GetTopicModelArgs get_topic_model_args;
+    get_topic_model_args.set_eps(1.001f);
+    get_topic_model_args.set_matrix_layout(::artm::MatrixLayout_Sparse);
+    ::artm::TopicModel imported_model = master_component->GetTopicModel(get_topic_model_args);
+
+    std::set<std::string> remaining_topics;
+    for (auto& topic_name : master_config.topic_name()) remaining_topics.insert(topic_name);
+    for (auto& topic_name : imported_model.topic_name()) remaining_topics.erase(topic_name);
+    if (!remaining_topics.empty()) {
+      DictionaryData tmp_dictionary;
+      tmp_dictionary.set_name("cd85d76c-5869-41d9-93ca-f96f5f118fb8-temporary-dictionary");
+      for (int token_id = 0; token_id < imported_model.token_size(); token_id++) {
+        tmp_dictionary.add_token(imported_model.token(token_id));
+        tmp_dictionary.add_class_id(imported_model.class_id(token_id));
+      }
+      master_component->CreateDictionary(tmp_dictionary);
+
+      InitializeModelArgs tmp_model;
+      tmp_model.set_model_name("cd85d76c-5869-41d9-93ca-f96f5f118fb8-temporary-model");
+      for (auto& topic_name : remaining_topics) tmp_model.add_topic_name(topic_name);
+      tmp_model.set_dictionary_name(tmp_dictionary.name());
+      tmp_model.set_seed(static_cast< int >(options.rand_seed));
+      master_component->InitializeModel(tmp_model);
+
+      MergeModelArgs merge_model_args;
+      merge_model_args.add_nwt_source_name(pwt_model_name); merge_model_args.add_source_weight(1.0f);
+      merge_model_args.add_nwt_source_name(tmp_model.model_name()); merge_model_args.add_source_weight(1.0f);
+      merge_model_args.set_nwt_target_name(pwt_model_name);
+      merge_model_args.mutable_topic_name()->CopyFrom(master_config.topic_name());
+      master_component->MergeModel(merge_model_args);
+
+      master_component->DisposeDictionary(tmp_dictionary.name());
+      master_component->DisposeModel(tmp_model.model_name());
+    }
   } else if (options.isModelRequired()) {
     ProgressScope scope("Initializing random model from dictionary");
     InitializeModelArgs initialize_model_args;
@@ -1250,7 +1315,11 @@ int execute(const artm_options& options, int argc, char* argv[]) {
     }
 
     CuckooWatch timer;
-    if (iter == 0) std::cerr << "================= Processing started.\n";
+    if (iter == 0) {
+      std::cerr << "================= Scores before processing.\n";
+      score_helper.showScores(0, 0);
+      std::cerr << "================= Processing started.\n";
+    }
 
     if (options.update_every > 0) {  // online algorithm
       FitOnlineMasterModelArgs fit_online_args;
@@ -1267,19 +1336,33 @@ int execute(const artm_options& options, int argc, char* argv[]) {
       for (auto& batch_file_name : batch_file_names)
         fit_online_args.add_batch_filename(batch_file_name.string());
 
-      master_component->FitOnlineModel(fit_online_args);
+      std::future<void> future = std::async(std::launch::async, [master_component, fit_online_args]() {
+        master_component->FitOnlineModel(fit_online_args);
+      });
+
+      const int timeout_sec = options.profile > 0 ? options.profile : 60;
+      while (future.wait_for(std::chrono::seconds(timeout_sec)) != std::future_status::ready) {
+        if (options.profile > 0) { output_profile_information(*master_component); std::cerr << "===========================================\n"; }
+      }
     } else {
       FitOfflineMasterModelArgs fit_offline_args;
       for (auto& batch_file_name : batch_file_names)
         fit_offline_args.add_batch_filename(batch_file_name.string());
 
-      master_component->FitOfflineModel(fit_offline_args);
+      std::future<void> future = std::async(std::launch::async, [master_component, fit_offline_args]() {
+        master_component->FitOfflineModel(fit_offline_args);
+      });
+
+      const int timeout_sec = options.profile > 0 ? options.profile : 60;
+      while (future.wait_for(std::chrono::seconds(timeout_sec)) != std::future_status::ready) {
+        if (options.profile > 0) { output_profile_information(*master_component); std::cerr << "===========================================\n"; }
+      }
     }
 
     score_helper.showScores(iter + 1, timer.elapsed_ms());
   }  // iter
 
-  if ((options.num_collection_passes > 0) || (options.time_limit > 0))
+  if ((options.num_collection_passes > 0) || (options.time_limit > 0) || (options.score_level == 0 && !options.final_score.empty()))
     final_score_helper.showScores();
 
   if (!options.save_model.empty()) {
@@ -1315,6 +1398,7 @@ int execute(const artm_options& options, int argc, char* argv[]) {
     ProgressScope scope(std::string("Saving model in readable format to ") + options.write_model_readable);
     GetTopicModelArgs get_topic_model_args;
     get_topic_model_args.set_model_name(pwt_model_name);
+    get_topic_model_args.mutable_class_id()->CopyFrom(master_config.class_id());
     CsvEscape escape(options.csv_separator.size() == 1 ? options.csv_separator[0] : '\0');
     ::artm::Matrix matrix;
     ::artm::TopicModel model = master_component->GetTopicModel(get_topic_model_args, &matrix);
@@ -1447,6 +1531,7 @@ int main(int argc, char * argv[]) {
       ("paused", po::bool_switch(&options.b_paused)->default_value(false), "start paused and waits for a keystroke (allows to attach a debugger)")
       ("disk-cache-folder", po::value(&options.disk_cache_folder)->default_value(""), "disk cache folder")
       ("disable-avx-opt", po::bool_switch(&options.b_disable_avx_opt)->default_value(false), "disable AVX optimization (gives similar behavior of the Processor component to BigARTM v0.5.4)")
+      ("profile", po::value(&options.profile)->default_value(0), "output diagnostics information; the value indicate frequency (in seconds)")
       ("time-limit", po::value(&options.time_limit)->default_value(0), "limit execution time in milliseconds")
       ("log-dir", po::value(&options.log_dir), "target directory for logging (GLOG_log_dir)")
       ("log-level", po::value(&options.log_level), "min logging level (GLOG_minloglevel; INFO=0, WARNING=1, ERROR=2, and FATAL=3)")

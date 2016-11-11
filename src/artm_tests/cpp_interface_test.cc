@@ -12,6 +12,7 @@
 #include "artm/cpp_interface.h"
 #include "artm/core/exceptions.h"
 #include "artm/core/common.h"
+#include "artm/core/protobuf_helpers.h"
 
 #include "artm/core/internals.pb.h"
 #include "artm/core/helpers.h"
@@ -83,7 +84,8 @@ void RunBasicTest(bool serialize_as_json) {
   artm::MasterModel master_component(master_config);
   ::artm::test::Api api(master_component);
 
-  EXPECT_EQ(master_component.info().score_size(), 1);
+  EXPECT_GT(master_component.info().score_size(), 1);
+  EXPECT_EQ(master_component.info().score(0).name(), "PerplexityScore");
   EXPECT_EQ(master_component.info().regularizer_size(), 1);
 
   // Load doc-token matrix
@@ -418,6 +420,9 @@ TEST(CppInterface, ProcessBatchesApi) {
   master_info = master.info();
   ASSERT_EQ(master_info.dictionary_size(), 2);
   EXPECT_EQ(master_info.dictionary(0).num_entries(), 1);
+  ASSERT_GE(master_info.model_size(), 1);
+  for (auto& model_info : master_info.model())
+    EXPECT_GT(model_info.byte_size(), 0);
 
   {
     artm::MasterModel master_clone(api.Duplicate(::artm::DuplicateMasterComponentArgs()));
@@ -665,4 +670,94 @@ TEST(ProtobufMessages, Json) {
   ASSERT_EQ(::google::protobuf::util::JsonStringToMessage("{num_processors:12}", &config2),
             ::google::protobuf::util::Status::OK);
   ASSERT_EQ(config.num_processors(), config2.num_processors());
+}
+
+// artm_tests.exe --gtest_filter=CppInterface.ReconfigureTopics
+TEST(CppInterface, ReconfigureTopics) {
+  ::artm::MasterModelConfig config;
+  config.add_topic_name("t1"); config.add_topic_name("t2"); config.add_topic_name("t3");
+  ::artm::DictionaryData dict; dict.add_token("token"); dict.set_name("d");
+
+  ::artm::MasterModel mm(config);
+  mm.CreateDictionary(dict);
+
+  ::artm::InitializeModelArgs init; init.set_dictionary_name("d");
+  mm.InitializeModel(init);
+  auto m1 = mm.GetTopicModel();
+  ASSERT_TRUE(::artm::core::repeated_field_equals(m1.topic_name(), config.topic_name()));
+
+  config.clear_topic_name();
+  config.add_topic_name("t3"); config.add_topic_name("t1"); config.add_topic_name("t4");
+  mm.Reconfigure(config);
+  auto m2 = mm.GetTopicModel();
+  ASSERT_TRUE(::artm::core::repeated_field_equals(m2.topic_name(), config.topic_name()));
+  ASSERT_EQ(m2.token_weights(0).value(0), m1.token_weights(0).value(2));  // "t3"
+  ASSERT_EQ(m2.token_weights(0).value(1), m1.token_weights(0).value(0));  // "t1"
+  ASSERT_EQ(m2.token_weights(0).value(2), 0);  // "t4" (new topic)
+
+  ::artm::MergeModelArgs merge;
+  merge.add_topic_name("t4");  // used just to provide the set of tokens
+  merge.add_nwt_source_name(m1.name());
+  merge.set_nwt_target_name("tmp");
+  mm.MergeModel(merge);
+
+  init.clear_dictionary_name();
+  init.set_model_name("tmp");
+  mm.InitializeModel(init);
+  ::artm::GetTopicModelArgs get_model; get_model.set_model_name("tmp");
+  auto m3 = mm.GetTopicModel(get_model);
+  ASSERT_TRUE(::artm::core::repeated_field_equals(m3.topic_name(), merge.topic_name()));
+  ASSERT_NE(m3.token_weights(0).value(0), 0.0f);
+
+  merge.clear_topic_name();
+  merge.clear_nwt_source_name();
+  merge.add_nwt_source_name(m1.name());
+  merge.add_nwt_source_name("tmp");
+  merge.set_nwt_target_name(m1.name());
+  mm.MergeModel(merge);
+  auto m4 = mm.GetTopicModel();
+  ASSERT_TRUE(::artm::core::repeated_field_equals(m4.topic_name(), config.topic_name()));
+  ASSERT_EQ(m4.token_weights(0).value(0), m2.token_weights(0).value(0));  // t3, from m2
+  ASSERT_EQ(m4.token_weights(0).value(1), m2.token_weights(0).value(1));  // t1, from m2
+  ASSERT_EQ(m4.token_weights(0).value(2), m3.token_weights(0).value(0));  // t4, from m3
+}
+
+// artm_tests.exe --gtest_filter=CppInterface.MergeModelWithDictionary
+TEST(CppInterface, MergeModelWithDictionary) {
+  ::artm::MasterModelConfig config;
+  config.add_topic_name("t1");
+  ::artm::DictionaryData dict1; dict1.set_name("d1"); dict1.add_token("t1"); dict1.add_token("t2");
+  ::artm::DictionaryData dict2; dict2.set_name("d2"); dict2.add_token("t3"); dict2.add_token("t1");
+  ::artm::DictionaryData dict3; dict3.set_name("d3"); dict3.add_token("t1"); dict3.add_token("t4");
+  dict3.add_token("t2");
+
+  ::artm::MasterModel mm(config);
+  mm.CreateDictionary(dict1);
+  mm.CreateDictionary(dict2);
+  mm.CreateDictionary(dict3);
+
+  ::artm::InitializeModelArgs init;
+  init.set_dictionary_name("d1"); init.set_model_name("m1"); mm.InitializeModel(init);
+  init.set_dictionary_name("d2"); init.set_model_name("m2"); mm.InitializeModel(init);
+
+  ::artm::GetTopicModelArgs get_model;
+  get_model.set_model_name("m1"); auto m1 = mm.GetTopicModel(get_model);
+  get_model.set_model_name("m2"); auto m2 = mm.GetTopicModel(get_model);
+
+  ::artm::MergeModelArgs merge;
+  merge.add_nwt_source_name("m1");
+  merge.add_nwt_source_name("m2");
+  merge.set_nwt_target_name("m");
+  merge.set_dictionary_name("d3");
+  mm.MergeModel(merge);
+  get_model.set_model_name("m"); auto m = mm.GetTopicModel(get_model);
+
+  ASSERT_EQ(m.token_size(), 3);
+  ASSERT_EQ(m.token(0), "t1");
+  ASSERT_EQ(m.token(1), "t4");
+  ASSERT_EQ(m.token(2), "t2");
+
+  ASSERT_EQ(m.token_weights(0).value(0), m1.token_weights(0).value(0) + m2.token_weights(1).value(0));
+  ASSERT_EQ(m.token_weights(1).value(0), 0.0f);
+  ASSERT_EQ(m.token_weights(2).value(0), m1.token_weights(1).value(0));
 }

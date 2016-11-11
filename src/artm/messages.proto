@@ -284,6 +284,8 @@ message ItemsProcessedScoreConfig {
 message ItemsProcessedScore {
   optional int32 value = 1 [default = 0];
   optional int32 num_batches = 2 [default = 0];
+  optional double token_weight = 3 [default = 0];
+  optional double token_weight_in_effect = 4 [default = 0];
 }
 
 // Represents a configuration of a top tokens score
@@ -577,6 +579,7 @@ message MergeModelArgs {
   repeated string nwt_source_name = 2;
   repeated float source_weight = 3;
   repeated string topic_name = 4;
+  optional string dictionary_name = 5;
 }
 
 message RegularizeModelArgs {
@@ -623,6 +626,7 @@ message MasterComponentInfo {
   message DictionaryInfo {
     optional string name = 1;
     optional int64 num_entries = 2;
+    optional int64 byte_size = 3;
   }
 
   message BatchInfo {
@@ -636,6 +640,7 @@ message MasterComponentInfo {
     optional string type = 2;
     optional int32 num_topics = 3;
     optional int32 num_tokens = 4;
+    optional int64 byte_size = 5;
   }
 
   message CacheEntryInfo {

@@ -259,6 +259,70 @@ TEST(MultipleClasses, BasicTest) {
   EXPECT_GT(max_diff, 0.001);  // "theta_matrix3 != theta_matrix1");
 }
 
+// artm_tests.exe --gtest_filter=MultipleClasses.InitializeSomeModalities
+TEST(MultipleClasses, InitializeSomeModalities) {
+  int nTokens = 60;
+  int nDocs = 100;
+  int nTopics = 10;
+
+  ::artm::MasterModelConfig master_config = ::artm::test::TestMother::GenerateMasterModelConfig(nTopics);
+  master_config.add_class_id("@default_class");
+  master_config.add_class_id("__custom_class");
+
+  ::artm::DictionaryData d1;
+  d1.set_name("d1");
+  d1.add_class_id("@default_class"); d1.add_token("t1");
+  d1.add_class_id("not present"); d1.add_token("t2");
+
+  ::artm::DictionaryData d2; d2.set_name("d2");
+  d2.add_class_id("not present"); d2.add_token("t2");
+
+  ::artm::MasterModel mm(master_config);
+  mm.CreateDictionary(d1);
+  mm.CreateDictionary(d2);
+
+  ::artm::InitializeModelArgs ia;
+  ia.set_dictionary_name("d1");
+  mm.InitializeModel(ia);
+  auto tm = mm.GetTopicModel();
+  ASSERT_EQ(tm.token_size(), 1);
+  ASSERT_EQ(tm.token(0), "t1");
+
+  ia.set_dictionary_name("d2");
+  ia.set_model_name("m2");
+  ASSERT_THROW(mm.InitializeModel(ia), ::artm::InvalidOperationException);
+}
+
+// artm_tests.exe --gtest_filter=MultipleClasses.ThrowIfNoTokensInEffect
+TEST(MultipleClasses, ThrowIfNoTokensInEffect) {
+  int nTokens = 60;
+  int nDocs = 100;
+  int nTopics = 10;
+  int nIters = 5;
+
+  ::artm::MasterModelConfig master_config = ::artm::test::TestMother::GenerateMasterModelConfig(nTopics);
+  master_config.add_class_id("@default_class"); master_config.add_class_weight(0.5f);
+  master_config.add_class_id("__custom_class"); master_config.add_class_weight(2.0f);
+
+  ::artm::MasterModelConfig master_config_reg(master_config);
+
+  // Generate doc-token matrix
+  artm::Batch batch = GenerateBatch(nTokens, nDocs, "@default_class", "__custom_class");
+  std::vector<std::shared_ptr< ::artm::Batch>> batches;
+  batches.push_back(std::make_shared< ::artm::Batch>(batch));
+
+  ::artm::MasterModel master(master_config);
+  ::artm::test::Api api(master);
+  auto offlineArgs = api.Initialize(batches);
+
+  master_config.clear_class_id(); master_config.clear_class_weight();
+  master_config.add_class_id("__unknown_class");
+  master.Reconfigure(master_config);
+
+  // Index doc-token matrix
+  ASSERT_THROW(master.FitOfflineModel(offlineArgs), ::artm::InvalidOperationException);
+}
+
 void configureTopTokensScore(std::string score_name, std::string class_id, artm::MasterModelConfig* master_config) {
   ::artm::ScoreConfig score_config;
   ::artm::TopTokensScoreConfig top_tokens_config;

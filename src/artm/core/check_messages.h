@@ -311,7 +311,7 @@ inline std::string DescribeErrors(const ::artm::InitializeModelArgs& message) {
   }
 
   if (!message.has_dictionary_name()) {
-    ss << "InitializeModelArgs.dictionary_name is not defined; ";
+    // Allow this to initialize an existing model
   }
 
   return ss.str();
@@ -433,10 +433,18 @@ inline std::string DescribeErrors(const ::artm::ImportBatchesArgs& message) {
   return ss.str();
 }
 
+inline std::string DescribeErrors(const ::artm::MergeModelArgs& message) {
+  std::stringstream ss;
+
+  if (message.source_weight_size() != 0 && message.source_weight_size() != message.nwt_source_name_size())
+    ss << "Length mismatch in fields MergeModelArgs.source_weight and MergeModelArgs.nwt_source_name";
+
+  return ss.str();
+}
+
 // Empty ValidateMessage routines
 inline std::string DescribeErrors(const ::artm::GetTopicModelArgs& message) { return std::string(); }
 inline std::string DescribeErrors(const ::artm::GetThetaMatrixArgs& message) { return std::string(); }
-inline std::string DescribeErrors(const ::artm::MergeModelArgs& message) { return std::string(); }
 inline std::string DescribeErrors(const ::artm::RegularizeModelArgs& message) { return std::string(); }
 inline std::string DescribeErrors(const ::artm::NormalizeModelArgs& message) { return std::string(); }
 inline std::string DescribeErrors(const ::artm::RegularizerConfig& message) { return std::string(); }
@@ -638,6 +646,11 @@ inline void FixMessage(::artm::MasterModelConfig* message) {
     if (!score_config->has_model_name())
       score_config->set_model_name(message->pwt_name());
   }
+
+  ScoreConfig* items_processed_score = message->add_score_config();
+  items_processed_score->set_name("^^^ItemsProcessedScore^^^");
+  items_processed_score->set_type(ScoreType_ItemsProcessed);
+  items_processed_score->set_config(::artm::ItemsProcessedScore().SerializeAsString());
 }
 
 template<>
@@ -689,6 +702,14 @@ template<>
 inline void FixMessage(::artm::ScoreArray* message) {
   for (int i = 0; i < message->score_size(); ++i)
     FixMessage(message->mutable_score(i));
+}
+
+template<>
+inline void FixMessage(::artm::MergeModelArgs* message) {
+  if (message->source_weight().empty()) {
+    for (int i = 0; i < message->nwt_source_name_size(); ++i)
+      message->add_source_weight(1.0f);
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -909,6 +930,17 @@ inline std::string DescribeMessage(const ::artm::ConfigureLoggingArgs& message) 
   ss << ", stop_logging_if_full_disk=" <<
     (message.has_stop_logging_if_full_disk() ? (message.stop_logging_if_full_disk() ? "yes" : "no") : "");
 
+  return ss.str();
+}
+
+template<>
+inline std::string DescribeMessage(const ::artm::ItemsProcessedScore& message) {
+  std::stringstream ss;
+  ss << "ItemsProcessed";
+  ss << ", num_items=" << message.value();
+  ss << ", num_batches=" << message.num_batches();
+  ss << ", token_weight=" << message.token_weight();
+  ss << ", token_weight_in_effect=" << message.token_weight_in_effect();
   return ss.str();
 }
 

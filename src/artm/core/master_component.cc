@@ -28,6 +28,7 @@
 #include "artm/core/check_messages.h"
 #include "artm/core/instance.h"
 #include "artm/core/processor.h"
+#include "artm/core/protobuf_helpers.h"
 #include "artm/core/phi_matrix_operations.h"
 #include "artm/core/score_manager.h"
 #include "artm/core/dense_phi_matrix.h"
@@ -65,10 +66,32 @@ static void HandleExternalThetaMatrixRequest(::artm::ThetaMatrix* theta_matrix, 
 }
 
 void MasterComponent::CreateOrReconfigureMasterComponent(const MasterModelConfig& config, bool reconfigure) {
-  if (!reconfigure)
+  if (!reconfigure) {
     instance_ = std::make_shared<Instance>(config);
-  else
+  } else {
+    auto old_config = instance_->config();
     instance_->Reconfigure(config);
+
+    // If there is a change in config.topic_name, update all phi matrices to new set of topics
+    // Topics that were removed from the config will be also removed from phi matrices.
+    // New topics will be initialized with zeros.
+    if (!repeated_field_equals(old_config->topic_name(), config.topic_name())) {
+      auto model_names = instance_->models()->keys();
+      for (auto model_name : model_names) {
+        auto model = instance_->GetPhiMatrixSafe(model_name);
+
+        // Ignore models where set of topics doesn't match the old config
+        if (!repeated_field_equals(model->topic_name(), old_config->topic_name()))
+          continue;
+
+        MergeModelArgs merge;
+        merge.add_nwt_source_name(model_name);
+        merge.add_source_weight(1.0f);
+        merge.set_nwt_target_name(model_name);
+        MergeModel(merge);
+      }
+    }
+  }
 
   if (reconfigure) {  // remove all regularizers
     instance_->regularizers()->clear();
@@ -275,7 +298,7 @@ void MasterComponent::ImportModel(const ImportModelArgs& args) {
     if (target == nullptr)
       target = std::make_shared<DensePhiMatrix>(args.model_name(), topic_model.topic_name());
 
-    PhiMatrixOperations::ApplyTopicModelOperation(topic_model, 1.0f, target.get());
+    PhiMatrixOperations::ApplyTopicModelOperation(topic_model, 1.0f, /* add_missing_tokens = */ true, target.get());
   }
 
   fin.close();
@@ -311,34 +334,69 @@ void MasterComponent::InitializeModel(const InitializeModelArgs& args) {
     FixMessage(mutable_args);
   }
 
-  auto dict = instance_->dictionaries()->get(args.dictionary_name());
-  if (dict == nullptr) {
+  std::shared_ptr<PhiMatrix> new_ttm;
+  int excluded_tokens = 0;
+  if (args.has_dictionary_name()) {
+    auto dict = instance_->dictionaries()->get(args.dictionary_name());
+    if (dict == nullptr) {
+      std::stringstream ss;
+      ss << "Dictionary '" << args.dictionary_name() << "' does not exist";
+      BOOST_THROW_EXCEPTION(InvalidOperation(ss.str()));
+    }
+
+    if (dict->size() == 0) {
+      std::stringstream ss;
+      ss << "Dictionary '" << args.dictionary_name() << "' has no entries";
+      BOOST_THROW_EXCEPTION(InvalidOperation(ss.str()));
+    }
+
+    new_ttm = std::make_shared< ::artm::core::DensePhiMatrix>(args.model_name(), args.topic_name());
+    for (int index = 0; index < dict->size(); ++index) {
+      ::artm::core::Token token = dict->entry(index)->token();
+      if (config->class_id_size() > 0 && !is_member(token.class_id, config->class_id()))
+        continue;
+      int token_id = new_ttm->AddToken(token);
+    }
+
+    excluded_tokens = dict->size() - new_ttm->token_size();
+    LOG_IF(INFO, excluded_tokens > 0)
+      << excluded_tokens
+      << " tokens were present in the dictionary, but excluded from the model";
+
+  } else {
+    // Initialize without dictionary from an existing model
+    std::shared_ptr<const PhiMatrix> ttm = instance_->GetPhiMatrix(args.model_name());
+    if (ttm == nullptr) {
+      std::stringstream ss;
+      ss << "Invalid usage of InitializeModelArgs --- ";
+      ss << "InitializeModelArgs.dictionary is empty, and model '" << args.model_name() << "' does not exist; ";
+      BOOST_THROW_EXCEPTION(InvalidOperation(ss.str()));
+    }
+
+    new_ttm = ttm->Duplicate();
+    PhiMatrixOperations::AssignValue(0.0f, new_ttm.get());
+  }
+
+  if (new_ttm->token_size() == 0) {
     std::stringstream ss;
-    ss << "Dictionary '" << args.dictionary_name() << "' does not exist";
+    ss << "Unable to initialize matrix from " << args.dictionary_name() << " dictionary. ";
+    ss << "Either the dictionary is empty, or no tokens in the dictionary matches class_id(s), ";
+    ss << "listed in the configuration of the model";
     BOOST_THROW_EXCEPTION(InvalidOperation(ss.str()));
   }
 
-  if (dict->size() == 0) {
-    std::stringstream ss;
-    ss << "Dictionary '" << args.dictionary_name() << "' has no entries";
-    BOOST_THROW_EXCEPTION(InvalidOperation(ss.str()));
-  }
-
-  LOG(INFO) << "InitializeModel() with "
-            << args.topic_name_size() << " topics and "
-            << dict->size() << " tokens";
-
-  auto new_ttm = std::make_shared< ::artm::core::DensePhiMatrix>(args.model_name(), args.topic_name());
-  for (int index = 0; index < dict->size(); ++index) {
-    ::artm::core::Token token = dict->entry(index)->token();
+  for (int token_index = 0; token_index < new_ttm->token_size(); token_index++) {
+    Token token = new_ttm->token(token_index);
     std::vector<float> vec = Helpers::GenerateRandomVector(new_ttm->topic_size(), token, args.seed());
-    int token_id = new_ttm->AddToken(token);
-    new_ttm->increase(token_id, vec);
+    new_ttm->increase(token_index, vec);
   }
 
   PhiMatrixOperations::FindPwt(*new_ttm, new_ttm.get());
-
   instance_->SetPhiMatrix(args.model_name(), new_ttm);
+
+  LOG(INFO) << "InitializeModel() created matrix " << new_ttm->model_name()
+            << " with " << args.topic_name_size() << " topics and "
+            << new_ttm->token_size() << " tokens; ";
 }
 
 void MasterComponent::FilterDictionary(const FilterDictionaryArgs& args) {
@@ -539,7 +597,40 @@ void MasterComponent::MergeModel(const MergeModelArgs& merge_model_args) {
     BOOST_THROW_EXCEPTION(InvalidOperation(
       "MergeModelArgs.nwt_source_name_size() != MergeModelArgs.source_weight_size()"));
 
-  std::shared_ptr<DensePhiMatrix> nwt_target;
+  std::shared_ptr<MasterModelConfig> config = instance_->config();
+  if (config != nullptr) {
+    MergeModelArgs* mutable_args = const_cast<MergeModelArgs*>(&merge_model_args);
+    if (merge_model_args.topic_name_size() == 0) mutable_args->mutable_topic_name()->CopyFrom(config->topic_name());
+    FixMessage(mutable_args);
+  }
+
+  if (merge_model_args.topic_name_size() == 0) {
+    // Auto-detect topic names from a source matrix (the first one in the list)
+    for (int i = 0; i < merge_model_args.nwt_source_name_size(); ++i) {
+      ModelName model_name = merge_model_args.nwt_source_name(i);
+      std::shared_ptr<const PhiMatrix> phi_matrix = instance_->GetPhiMatrix(model_name);
+      if (phi_matrix != nullptr) {
+        const_cast<MergeModelArgs*>(&merge_model_args)->mutable_topic_name()->CopyFrom(phi_matrix->topic_name());
+        break;
+      }
+    }
+  }
+
+  std::shared_ptr<DensePhiMatrix> nwt_target = std::make_shared<DensePhiMatrix>(
+    merge_model_args.nwt_target_name(), merge_model_args.topic_name());
+
+  std::shared_ptr<Dictionary> dictionary = nullptr;
+  if (merge_model_args.has_dictionary_name()) {
+    dictionary = instance_->dictionaries()->get(merge_model_args.dictionary_name());
+    if (dictionary == nullptr || dictionary->size() == 0) {
+      BOOST_THROW_EXCEPTION(InvalidOperation("Dictionary " +
+        merge_model_args.dictionary_name() + " does not exist or has no tokens"));
+    }
+
+    for (int token_index = 0; token_index < dictionary->size(); token_index++)
+      nwt_target->AddToken(dictionary->entry(token_index)->token());
+  }
+
   std::stringstream ss;
   for (int i = 0; i < merge_model_args.nwt_source_name_size(); ++i) {
     ModelName model_name = merge_model_args.nwt_source_name(i);
@@ -554,16 +645,11 @@ void MasterComponent::MergeModel(const MergeModelArgs& merge_model_args) {
     }
     const PhiMatrix& n_wt = *phi_matrix;
 
-    if (nwt_target == nullptr) {
-      nwt_target = std::make_shared<DensePhiMatrix>(
-        merge_model_args.nwt_target_name(),
-        merge_model_args.topic_name_size() != 0 ? merge_model_args.topic_name() : n_wt.topic_name());
-    }
-
     if (n_wt.token_size() > 0) {
       ::artm::TopicModel topic_model;
       PhiMatrixOperations::RetrieveExternalTopicModel(n_wt, GetTopicModelArgs(), &topic_model);
-      PhiMatrixOperations::ApplyTopicModelOperation(topic_model, weight, nwt_target.get());
+      const bool add_missing_tokens = (dictionary == nullptr);
+      PhiMatrixOperations::ApplyTopicModelOperation(topic_model, weight, add_missing_tokens, nwt_target.get());
     }
   }
 
@@ -634,12 +720,31 @@ void MasterComponent::OverwriteTopicModel(const ::artm::TopicModel& args) {
     if (!args.has_name()) const_cast< ::artm::TopicModel*>(&args)->set_name(config->pwt_name());
 
   auto target = std::make_shared<DensePhiMatrix>(args.name(), args.topic_name());
-  PhiMatrixOperations::ApplyTopicModelOperation(args, 1.0f, target.get());
+  PhiMatrixOperations::ApplyTopicModelOperation(args, 1.0f, /* add_missing_tokens = */ true, target.get());
   instance_->SetPhiMatrix(args.name(), target);
 }
 
 void MasterComponent::Request(const GetThetaMatrixArgs& args, ::artm::ThetaMatrix* result) {
   instance_->cache_manager()->RequestThetaMatrix(args, result);
+}
+
+static void ValidateProcessedItems(std::string method_description, MasterComponent* master) {
+  ::artm::GetScoreValueArgs get_items_processed;
+  ::artm::ScoreData items_processed_data;
+  get_items_processed.set_score_name("^^^ItemsProcessedScore^^^");
+  master->Request(get_items_processed, &items_processed_data);
+  ::artm::ItemsProcessedScore items_processed;
+  items_processed.ParseFromString(items_processed_data.data());
+  LOG(INFO) << method_description << ": " << DescribeMessage(items_processed);
+  if (items_processed.num_batches() == 0)
+    BOOST_THROW_EXCEPTION(InvalidOperation(method_description + ": no batches to process"));
+  if (items_processed.value() == 0)
+    BOOST_THROW_EXCEPTION(InvalidOperation(method_description + ": no items to process --- all batches were empty"));
+  if (items_processed.token_weight() == 0)
+    BOOST_THROW_EXCEPTION(InvalidOperation(method_description + ": no tokens to process --- all items were empty"));
+  if (items_processed.token_weight_in_effect() == 0)
+    BOOST_THROW_EXCEPTION(InvalidOperation(method_description +
+      ": no tokens in effect --- either tokens not present in the model, or tokens were ignored due to class_id"));
 }
 
 void MasterComponent::Request(const GetThetaMatrixArgs& args,
@@ -688,6 +793,7 @@ void MasterComponent::Request(const TransformMasterModelArgs& args, ::artm::Thet
   BatchManager batch_manager;
   RequestProcessBatchesImpl(process_batches_args, &batch_manager,
                             /* async =*/ false, /*score_manager =*/ nullptr, result);
+  ValidateProcessedItems("Transform", this);
 }
 
 void MasterComponent::Request(const TransformMasterModelArgs& args,
@@ -1020,6 +1126,8 @@ void MasterComponent::FitOnline(const FitOnlineMasterModelArgs& args) {
   } else {
     artm_executor.ExecuteOnlineAlgorithm(&iter);
   }
+
+  ValidateProcessedItems("FitOnline", this);
 }
 
 void MasterComponent::FitOffline(const FitOfflineMasterModelArgs& args) {
@@ -1054,6 +1162,8 @@ void MasterComponent::FitOffline(const FitOfflineMasterModelArgs& args) {
   ArtmExecutor artm_executor(*config, this);
   OfflineBatchesIterator iter(args.batch_filename(), args.batch_weight());
   artm_executor.ExecuteOfflineAlgorithm(args.num_collection_passes(), &iter);
+
+  ValidateProcessedItems("FitOffline", this);
 }
 
 }  // namespace core
